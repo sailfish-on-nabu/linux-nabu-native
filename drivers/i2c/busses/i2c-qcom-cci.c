@@ -438,6 +438,22 @@ static int cci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 					    msgs[i].addr, msgs[i].buf,
 					    msgs[i].len);
 
+		/*
+		 * On nabu the first queue may stall after a camera power
+		 * transition. cci_run_queue() resets and reinitializes the
+		 * controller on timeout; retry while the sensor stays powered.
+		 */
+		if (ret == -ETIMEDOUT && of_machine_is_compatible("xiaomi,nabu")) {
+			if (msgs[i].flags & I2C_M_RD)
+				ret = cci_i2c_read(cci, cci_master->master,
+						   msgs[i].addr, msgs[i].buf,
+						   msgs[i].len);
+			else
+				ret = cci_i2c_write(cci, cci_master->master,
+						    msgs[i].addr, msgs[i].buf,
+						    msgs[i].len);
+		}
+
 		if (ret < 0)
 			break;
 	}

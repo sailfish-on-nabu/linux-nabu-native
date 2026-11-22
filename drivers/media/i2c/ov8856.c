@@ -2006,6 +2006,8 @@ static int ov8856_start_streaming(struct ov8856 *ov8856)
 	unsigned int i;
 	int link_freq_index, ret;
 
+	/* Recheck the sensor and CCI transport after each power-up. */
+	ov8856->identified = false;
 	ret = ov8856_identify_module(ov8856);
 	if (ret)
 		return ret;

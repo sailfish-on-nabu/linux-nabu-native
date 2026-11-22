@@ -16,6 +16,7 @@
 #include <video/mipi_display.h>
 
 #include <drm/drm_connector.h>
+#include <drm/drm_notifier.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
@@ -26,6 +27,12 @@
 
 #define DSI_NUM_MIN 1
 
+/* Opt-in hardware isolation test; keep the normal sleep path as default. */
+static bool gesture_display_off_only;
+module_param(gesture_display_off_only, bool, 0644);
+MODULE_PARM_DESC(gesture_display_off_only,
+	"Diagnostic: keep TDDI scan logic out of DCS sleep while gestures are enabled");
+
 struct panel_info {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi[2];
@@ -35,6 +42,7 @@ struct panel_info {
 	struct gpio_desc *reset_gpio;
 	struct backlight_device *backlight;
 	struct regulator *vddio;
+	bool gesture_retained;
 };
 
 struct panel_desc {
@@ -1409,10 +1417,16 @@ static int nt36523_prepare(struct drm_panel *panel)
 	struct panel_info *pinfo = to_panel_info(panel);
 	int ret;
 
-	ret = regulator_enable(pinfo->vddio);
-	if (ret) {
-		dev_err(panel->dev, "failed to enable vddio regulator: %d\n", ret);
-		return ret;
+	/* Quiesce the touch IRQ before reset/firmware loss on retained resume. */
+	if (pinfo->gesture_retained) {
+		mi_drm_notifier_call_chain(MI_DRM_EVENT_TOUCH_RESET, NULL);
+		pinfo->gesture_retained = false;
+	} else {
+		ret = regulator_enable(pinfo->vddio);
+		if (ret) {
+			dev_err(panel->dev, "failed to enable vddio regulator: %d\n", ret);
+			return ret;
+		}
 	}
 
 	nt36523_reset(pinfo);
@@ -1432,16 +1446,32 @@ static int nt36523_disable(struct drm_panel *panel)
 	struct panel_info *pinfo = to_panel_info(panel);
 	int i;
 
+	if (pinfo->desc == &nabu_csot_desc) {
+		struct drm_touch_sleep sleep = { };
+
+		/* Complete the SPI command before DCS sleep and power removal. */
+		mi_drm_notifier_call_chain(MI_DRM_EVENT_TOUCH_SLEEP, &sleep);
+		pinfo->gesture_retained = sleep.gesture_active && !sleep.error;
+		if (sleep.error)
+			dev_warn(panel->dev, "touch gesture entry failed: %d\n",
+				 sleep.error);
+	}
+
 	for (i = 0; i < DSI_NUM_MIN + pinfo->desc->is_dual_dsi; i++) {
 		struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[i]};
 
 		mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
 	}
 
-	for (i = 0; i < DSI_NUM_MIN + pinfo->desc->is_dual_dsi; i++) {
-		struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[i]};
+	if (pinfo->gesture_retained && READ_ONCE(gesture_display_off_only)) {
+		/* Display is off, but leave TDDI scan clocks available for comparison. */
+		dev_info(panel->dev, "gesture diagnostic: DCS display-off without sleep-in\n");
+	} else {
+		for (i = 0; i < DSI_NUM_MIN + pinfo->desc->is_dual_dsi; i++) {
+			struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[i]};
 
-		mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
+			mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
+		}
 	}
 
 	msleep(70);
@@ -1452,6 +1482,10 @@ static int nt36523_disable(struct drm_panel *panel)
 static int nt36523_unprepare(struct drm_panel *panel)
 {
 	struct panel_info *pinfo = to_panel_info(panel);
+
+	/* The TDDI must keep its SRAM firmware and 1.8 V vote for gestures. */
+	if (pinfo->gesture_retained)
+		return 0;
 
 	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
 	regulator_disable(pinfo->vddio);

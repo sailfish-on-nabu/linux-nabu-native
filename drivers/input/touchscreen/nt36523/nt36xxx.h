@@ -79,6 +79,7 @@ struct nvt_ts_data {
 	struct input_dev *input_dev;
 	struct input_dev *pen_input_dev;
 	struct mutex xbuf_lock;
+	struct mutex state_lock;
 	struct pinctrl *ts_pinctrl;
 	struct pinctrl_state *pinctrl_state_active;
 	struct pinctrl_state *pinctrl_state_suspend;
@@ -93,7 +94,8 @@ struct nvt_ts_data {
 	const char *fw_name;
 	int ic_state;
 	int db_wakeup;
-	int gesture_command_delayed;
+	bool gesture_active;
+	bool irq_wake_enabled;
 	bool irq_enabled;
 	bool pen_support;
 	bool pen_input_dev_enable;

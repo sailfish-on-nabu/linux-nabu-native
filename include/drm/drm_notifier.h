@@ -22,6 +22,14 @@
 #define MI_DRM_EVENT_BLANK              0x01
 /* A hardware display blank early change occurred */
 #define MI_DRM_EARLY_EVENT_BLANK        0x02
+/* Synchronous TDDI handshakes before the panel sleeps or resets. */
+#define MI_DRM_EVENT_TOUCH_SLEEP        0x03
+#define MI_DRM_EVENT_TOUCH_RESET        0x04
+
+struct drm_touch_sleep {
+	bool gesture_active;
+	int error;
+};
 
 enum drm_notifier_data {
 	/* panel: power on */

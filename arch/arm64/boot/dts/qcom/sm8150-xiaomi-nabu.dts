@@ -1119,6 +1119,7 @@
 	touchscreen@0 {
 		compatible = "novatek,NVT-ts-spi";
 		reg = <0>;
+		wakeup-source;
 
 		spi-max-frequency = <9600000>;
 		novatek,irq-gpio = <&tlmm 39 0x2001>;

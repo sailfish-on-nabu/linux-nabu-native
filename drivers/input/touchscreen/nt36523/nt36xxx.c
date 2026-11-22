@@ -26,12 +26,14 @@
 #include <linux/debugfs.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of_irq.h>
+#include <linux/pm_wakeup.h>
 
 #ifdef CONFIG_DRM
 #include <drm/drm_notifier.h>
 #endif
 
 #include "nt36xxx.h"
+#include "nt36xxx_gesture.h"
 
 struct nvt_ts_data *ts;
 
@@ -760,7 +762,10 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		sched_set_fifo(touch_task);
 	}
 
-	if (ts->dev_pm_suspend) {
+	if (READ_ONCE(ts->gesture_active))
+		pm_wakeup_event(&ts->client->dev, 1000);
+
+	if (READ_ONCE(ts->dev_pm_suspend)) {
 		if (!wait_for_completion_timeout(&ts->dev_pm_suspend_completion,
 						 msecs_to_jiffies(500))) {
 			NVT_ERR("system(spi) can't finished resuming procedure, skip it\n");
@@ -806,6 +811,18 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 
 	if (nvt_fw_recovery(buf))
 		return IRQ_HANDLED;
+
+	if (!READ_ONCE(bTouchIsAwake)) {
+		dev_dbg_ratelimited(&ts->client->dev, "sleep packet: %*ph\n", 8, buf + 1);
+		if (READ_ONCE(ts->gesture_active) &&
+		    nvt_is_doubletap(buf, POINT_DATA_LEN + 1)) {
+			/* Native MCE gesture: show the lock screen, never unlock. */
+			input_event(ts->input_dev, EV_MSC, MSC_GESTURE, 4);
+			input_sync(ts->input_dev);
+			NVT_LOG("double-tap wake gesture\n");
+		}
+		return IRQ_HANDLED;
+	}
 
 	finger_cnt = 0;
 
@@ -1001,6 +1018,110 @@ Description:
 return:
 	Executive outcomes. 0---succeed. negative---failed
 *******************************************************/
+static ssize_t double_tap_wake_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct nvt_ts_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(data->db_wakeup) != 0);
+}
+
+static ssize_t double_tap_wake_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct nvt_ts_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &value);
+	if (ret)
+		return ret;
+	if (value != 0 && value != 1 && value != 4)
+		return -EINVAL;
+
+	mutex_lock(&data->state_lock);
+	if (device_may_wakeup(dev) == (value != 0))
+		ret = 0;
+	else
+		ret = device_set_wakeup_enable(dev, value != 0);
+	if (!ret)
+		WRITE_ONCE(data->db_wakeup, value != 0);
+	/* Re-arming while blank is useful after DCS sleep has completed. */
+	if (!ret && value && data->gesture_active && !data->dev_pm_suspend) {
+		u8 command[2] = { EVENT_MAP_HOST_CMD, 0x13 };
+		bool irq_enabled = data->irq_enabled;
+
+		nvt_irq_enable(false);
+		ret = nvt_set_page(data->mmap->EVENT_BUF_ADDR);
+		if (!ret)
+			ret = CTP_SPI_WRITE(data->client, command, sizeof(command));
+		msleep(20);
+		if (irq_enabled)
+			nvt_irq_enable(true);
+		NVT_LOG("rearm gesture after display sleep: %d\n", ret);
+	}
+	mutex_unlock(&data->state_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(double_tap_wake);
+
+static ssize_t gesture_active_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct nvt_ts_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(data->gesture_active));
+}
+static DEVICE_ATTR_RO(gesture_active);
+
+/* Read-only diagnostics for the opt-in gesture implementation. */
+static ssize_t gesture_status_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct nvt_ts_data *data = dev_get_drvdata(dev);
+	u8 host[2] = { EVENT_MAP_HOST_CMD };
+	u8 reset[6] = { EVENT_MAP_RESET_COMPLETE };
+	u8 point[9] = { 0 };
+	bool irq_enabled;
+	int ret;
+
+	mutex_lock(&data->state_lock);
+	if (data->dev_pm_suspend) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	irq_enabled = data->irq_enabled;
+	nvt_irq_enable(false);
+	ret = nvt_set_page(data->mmap->EVENT_BUF_ADDR);
+	if (!ret)
+		ret = CTP_SPI_READ(data->client, point, sizeof(point));
+	if (!ret)
+		ret = CTP_SPI_READ(data->client, host, sizeof(host));
+	if (!ret)
+		ret = CTP_SPI_READ(data->client, reset, sizeof(reset));
+	if (irq_enabled)
+		nvt_irq_enable(true);
+	if (!ret)
+		ret = sysfs_emit(buf, "awake=%u active=%u irq=%u wake_irq=%u host=%02x reset=%*ph point=%*ph\n",
+				 bTouchIsAwake, data->gesture_active,
+				 data->irq_enabled, data->irq_wake_enabled, host[1],
+				 5, reset + 1, 8, point + 1);
+out:
+	mutex_unlock(&data->state_lock);
+	return ret;
+}
+static DEVICE_ATTR_RO(gesture_status);
+
+static struct attribute *nvt_wakeup_attrs[] = {
+	&dev_attr_double_tap_wake.attr,
+	&dev_attr_gesture_active.attr,
+	&dev_attr_gesture_status.attr,
+	NULL,
+};
+static const struct attribute_group nvt_wakeup_group = {
+	.attrs = nvt_wakeup_attrs,
+};
+
 static int32_t nvt_ts_probe(struct spi_device *client)
 {
 	int32_t ret = 0;
@@ -1064,6 +1185,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	}
 
 	mutex_init(&ts->xbuf_lock);
+	mutex_init(&ts->state_lock);
 
 	//---eng reset before TP_RESX high
 	nvt_eng_reset();
@@ -1103,8 +1225,9 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 				  BIT_MASK(EV_ABS);
 	ts->input_dev->keybit[BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH);
 	ts->input_dev->propbit[0] = BIT(INPUT_PROP_DIRECT);
+	input_set_capability(ts->input_dev, EV_MSC, MSC_GESTURE);
 
-	ts->db_wakeup = 0;
+	ts->db_wakeup = device_property_read_bool(&client->dev, "wakeup-source");
 	ts->fw_ver = 0;
 	ts->x_num = 32;
 	ts->y_num = 50;
@@ -1228,7 +1351,8 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	ts->ic_state = NVT_IC_INIT;
 	ts->dev_pm_suspend = false;
-	ts->gesture_command_delayed = -1;
+	ts->gesture_active = false;
+	ts->irq_wake_enabled = false;
 	init_completion(&ts->dev_pm_suspend_completion);
 
 	ret = nvt_update_firmware(ts->fw_name);
@@ -1246,6 +1370,12 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	INIT_WORK(&ts->resume_work, nvt_resume_work);
 	INIT_WORK(&ts->suspend_work, nvt_suspend_work);
 
+	ret = device_init_wakeup(&client->dev, true);
+	if (ret)
+		goto err_init_wakeup;
+	if (!ts->db_wakeup)
+		device_set_wakeup_enable(&client->dev, false);
+
 #ifdef CONFIG_DRM
 	ts->drm_notif.notifier_call = nvt_drm_notifier_callback;
 	ret = mi_drm_register_client(&ts->drm_notif);
@@ -1255,6 +1385,10 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	}
 #endif
 
+	ret = sysfs_create_group(&client->dev.kobj, &nvt_wakeup_group);
+	if (ret)
+		goto err_create_wakeup_attrs;
+
 	bTouchIsAwake = 1;
 	disable_pen_input_device(false);
 	NVT_LOG("end\n");
@@ -1263,12 +1397,15 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	return 0;
 
+err_create_wakeup_attrs:
 #ifdef CONFIG_DRM
 	if (mi_drm_unregister_client(&ts->drm_notif))
 		NVT_ERR("Error occurred while unregistering drm_notifier.\n");
 err_register_drm_notif_failed:
 #endif
-
+	device_init_wakeup(&client->dev, false);
+err_init_wakeup:
+	destroy_workqueue(ts->event_wq);
 err_alloc_work_thread_failed:
 	free_irq(client->irq, ts);
 err_int_request_failed:
@@ -1294,6 +1431,7 @@ err_input_register_device_failed:
 err_input_dev_alloc_failed:
 err_chipvertrim_failed:
 	mutex_destroy(&ts->xbuf_lock);
+	mutex_destroy(&ts->state_lock);
 	nvt_gpio_deconfig(ts);
 err_gpio_config_failed:
 err_spi_setup:
@@ -1326,16 +1464,22 @@ return:
 static void nvt_ts_remove(struct spi_device *client)
 {
 	NVT_LOG("Removing driver...\n");
+	sysfs_remove_group(&client->dev.kobj, &nvt_wakeup_group);
 
 #ifdef CONFIG_DRM
 	if (mi_drm_unregister_client(&ts->drm_notif))
 		NVT_ERR("Error occurred while unregistering drm_notifier.\n");
 #endif
 
+	destroy_workqueue(ts->event_wq);
 	nvt_irq_enable(false);
+	if (ts->irq_wake_enabled)
+		disable_irq_wake(client->irq);
+	device_init_wakeup(&client->dev, false);
 	free_irq(client->irq, ts);
 
 	mutex_destroy(&ts->xbuf_lock);
+	mutex_destroy(&ts->state_lock);
 
 	nvt_gpio_deconfig(ts);
 
@@ -1354,6 +1498,8 @@ static void nvt_ts_remove(struct spi_device *client)
 	spi_set_drvdata(client, NULL);
 
 	if (ts) {
+		kfree(ts->xbuf);
+		kfree(ts->rbuf);
 		kfree(ts);
 		ts = NULL;
 	}
@@ -1362,15 +1508,16 @@ static void nvt_ts_remove(struct spi_device *client)
 static void nvt_ts_shutdown(struct spi_device *client)
 {
 	NVT_LOG("Shutdown driver...\n");
-
-	nvt_irq_enable(false);
-
 #ifdef CONFIG_DRM
-	if (mi_drm_unregister_client(&ts->drm_notif))
-		NVT_ERR("Error occurred while unregistering drm_notifier.\n");
+	mi_drm_unregister_client(&ts->drm_notif);
 #endif
-
 	destroy_workqueue(ts->event_wq);
+	nvt_irq_enable(false);
+	if (ts->irq_wake_enabled) {
+		disable_irq_wake(client->irq);
+		ts->irq_wake_enabled = false;
+	}
+	device_init_wakeup(&client->dev, false);
 }
 
 /*******************************************************
@@ -1382,97 +1529,99 @@ return:
 *******************************************************/
 static int32_t nvt_ts_suspend(struct device *dev)
 {
-	uint8_t buf[4] = { 0 };
-	uint32_t i = 0;
+	uint8_t buf[2] = { EVENT_MAP_HOST_CMD, 0x11 };
+	bool gesture;
+	int ret = 0;
+	u32 i;
 
-	if (!bTouchIsAwake) {
-		NVT_LOG("Touch is already suspend\n");
-		return 0;
-	}
+	mutex_lock(&ts->state_lock);
+	if (!bTouchIsAwake)
+		goto out;
 
 	pm_stay_awake(dev);
 	ts->ic_state = NVT_IC_SUSPEND_IN;
-
-	if (!ts->db_wakeup) {
-		if (!ts->irq_enabled)
-			NVT_LOG("IRQ already disabled\n");
-		else
-			nvt_irq_enable(false);
+	/* No IRQ may race the command or touch release sequence. */
+	nvt_irq_enable(false);
+	gesture = ts->db_wakeup && device_may_wakeup(dev);
+	if (ts->pen_support && ts->pen_input_dev_enable) {
+		ret = disable_pen_input_device(true);
+		if (ret)
+			NVT_ERR("pen scan disable failed: %d\n", ret);
+		/* Let the host-command mailbox consume 0x7b before 0x13. */
+		msleep(20);
 	}
-
-	NVT_LOG("suspend start\n");
-
-	bTouchIsAwake = 0;
-
-	if (ts->db_wakeup) {
-		/*---write command to enter "wakeup gesture mode"---*/
-		/*DoubleClick wakeup CMD was sent by display to meet timing*/
-		/*
-		buf[0] = EVENT_MAP_HOST_CMD;
+	WRITE_ONCE(bTouchIsAwake, 0);
+	if (gesture)
 		buf[1] = 0x13;
-		CTP_SPI_WRITE(ts->client, buf, 2);
-		*/
-		enable_irq_wake(ts->client->irq);
 
-		NVT_LOG("Enabled touch wakeup gesture\n");
-	} else {
-		/*---write command to enter "deep sleep mode"---*/
-		buf[0] = EVENT_MAP_HOST_CMD;
-		buf[1] = 0x11;
-		CTP_SPI_WRITE(ts->client, buf, 2);
+	ret = nvt_set_page(ts->mmap->EVENT_BUF_ADDR | EVENT_MAP_HOST_CMD);
+	if (!ret)
+		ret = CTP_SPI_WRITE(ts->client, buf, sizeof(buf));
+	if (!ret && gesture) {
+		u8 ack[2];
+		int attempt;
+
+		for (attempt = 0; attempt < 10; attempt++) {
+			msleep(10);
+			ack[0] = EVENT_MAP_HOST_CMD;
+			ret = CTP_SPI_READ(ts->client, ack, sizeof(ack));
+			if (ret || !ack[1])
+				break;
+		}
+		if (!ret && attempt == 10)
+			ret = -ETIMEDOUT;
+		NVT_LOG("gesture mailbox acknowledgement: %d\n", ret);
 	}
+	WRITE_ONCE(ts->gesture_active, gesture && !ret);
+	/* Keep the GPIO/PDC wake route armed during display-off CPU idle too. */
+	if (ts->gesture_active && !ts->irq_wake_enabled) {
+		ret = enable_irq_wake(ts->client->irq);
+		if (!ret)
+			ts->irq_wake_enabled = true;
+		else
+			WRITE_ONCE(ts->gesture_active, false);
+	}
+	if (ret)
+		NVT_ERR("sleep command 0x%02x failed: %d\n", buf[1], ret);
 
-	/* release all touches */
 	for (i = 0; i < ts->max_touch_num; i++) {
 		input_mt_slot(ts->input_dev, i);
 		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, 0);
 		input_report_abs(ts->input_dev, ABS_MT_PRESSURE, 0);
-		input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, 0);
+		input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, false);
 	}
 	input_report_key(ts->input_dev, BTN_TOUCH, 0);
 	input_sync(ts->input_dev);
-
-	msleep(50);
-	/* release pen event */
 	release_pen_event();
-	if (likely(ts->ic_state == NVT_IC_SUSPEND_IN))
-		ts->ic_state = NVT_IC_SUSPEND_OUT;
-	else
-		NVT_ERR("IC state may error,caused by suspend/resume flow, please CHECK!!");
+	msleep(gesture ? 20 : 50);
+	ts->ic_state = NVT_IC_SUSPEND_OUT;
+	if (ts->gesture_active)
+		nvt_irq_enable(true);
+	NVT_LOG("display sleep: gesture=%u, command=0x%02x, result=%d\n",
+		ts->gesture_active, buf[1], ret);
 	pm_relax(dev);
-	NVT_LOG("end\n");
-
-	return 0;
+out:
+	mutex_unlock(&ts->state_lock);
+	return ret;
 }
 
-/*******************************************************
-Description:
-	Novatek touchscreen driver resume function.
-
-return:
-	Executive outcomes. 0---succeed.
-*******************************************************/
 static int32_t nvt_ts_resume(struct device *dev)
 {
-	int32_t ret = 0;
+	int ret;
 
-	if (bTouchIsAwake) {
-		NVT_LOG("Touch is already resume\n");
-		return 0;
+	mutex_lock(&ts->state_lock);
+	if (bTouchIsAwake)
+		goto out;
+
+	/* Panel reset must not race an IRQ-driven SPI transfer. */
+	nvt_irq_enable(false);
+	if (ts->irq_wake_enabled) {
+		disable_irq_wake(ts->client->irq);
+		ts->irq_wake_enabled = false;
 	}
-
-	if (ts->dev_pm_suspend)
-		pm_stay_awake(dev);
-
-	NVT_LOG("resume start\n");
+	WRITE_ONCE(ts->gesture_active, false);
 	ts->ic_state = NVT_IC_RESUME_IN;
-
-	/*
-	 * Wake IC from deep sleep first, then reload firmware.
-	 * nvt_check_fw_reset_state() brings the IC out of deep sleep;
-	 * downloading while it is still asleep fails. Once awake,
-	 * re-downloading the firmware ensures touch interrupts work reliably.
-	 */
+	NVT_LOG("resume start\n");
 	ret = nvt_check_fw_reset_state(RESET_STATE_REK);
 	if (ret)
 		NVT_ERR("reset-state check failed (%d)\n", ret);
@@ -1482,29 +1631,13 @@ static int32_t nvt_ts_resume(struct device *dev)
 		NVT_ERR("download firmware failed (%d)\n", ret);
 		nvt_check_fw_reset_state(RESET_STATE_REK);
 	}
-
-	if (!ts->db_wakeup && !ts->irq_enabled)
-		nvt_irq_enable(true);
-
-	bTouchIsAwake = 1;
-
+	WRITE_ONCE(bTouchIsAwake, 1);
 	disable_pen_input_device(false);
-	if (likely(ts->ic_state == NVT_IC_RESUME_IN)) {
-		ts->ic_state = NVT_IC_RESUME_OUT;
-	} else {
-		NVT_ERR("IC state may error,caused by suspend/resume flow, please CHECK!!");
-	}
-	if (ts->gesture_command_delayed >= 0) {
-		ts->db_wakeup = ts->gesture_command_delayed;
-		ts->gesture_command_delayed = -1;
-		NVT_LOG("execute delayed command, set double click wakeup %d\n",
-			ts->db_wakeup);
-	}
-
-	if (ts->dev_pm_suspend)
-		pm_relax(dev);
-	NVT_LOG("end\n");
-
+	ts->ic_state = NVT_IC_RESUME_OUT;
+	nvt_irq_enable(true);
+	NVT_LOG("resume end\n");
+out:
+	mutex_unlock(&ts->state_lock);
 	return 0;
 }
 
@@ -1512,53 +1645,76 @@ static int32_t nvt_ts_resume(struct device *dev)
 static int nvt_drm_notifier_callback(struct notifier_block *self,
 				     unsigned long event, void *data)
 {
-	int blank = *(enum drm_notifier_data *)data;
 	struct nvt_ts_data *ts_data =
 		container_of(self, struct nvt_ts_data, drm_notif);
+	int blank;
 
-	if (data && ts_data) {
-		if (event == MI_DRM_EARLY_EVENT_BLANK) {
-			if (blank == MI_DRM_BLANK_POWERDOWN) {
-				NVT_LOG("event=%lu, *blank=%d\n", event, blank);
-				flush_workqueue(ts_data->event_wq);
-				queue_work(ts_data->event_wq,
-					   &ts_data->suspend_work);
-			}
-		} else if (event == MI_DRM_EVENT_BLANK) {
-			if (blank == MI_DRM_BLANK_UNBLANK) {
-				NVT_LOG("event=%lu, *blank=%d\n", event, blank);
-				flush_workqueue(ts_data->event_wq);
-				queue_work(ts_data->event_wq,
-					   &ts_data->resume_work);
-			}
-		}
+	if (event == MI_DRM_EVENT_TOUCH_SLEEP) {
+		struct drm_touch_sleep *sleep = data;
+
+		if (!sleep)
+			return NOTIFY_DONE;
+		flush_workqueue(ts_data->event_wq);
+		sleep->error = nvt_ts_suspend(&ts_data->client->dev);
+		sleep->gesture_active = READ_ONCE(ts_data->gesture_active);
+		return NOTIFY_OK;
 	}
+	if (event == MI_DRM_EVENT_TOUCH_RESET) {
+		flush_workqueue(ts_data->event_wq);
+		mutex_lock(&ts_data->state_lock);
+		nvt_irq_enable(false);
+		if (ts_data->irq_wake_enabled) {
+			disable_irq_wake(ts_data->client->irq);
+			ts_data->irq_wake_enabled = false;
+		}
+		WRITE_ONCE(ts_data->gesture_active, false);
+		mutex_unlock(&ts_data->state_lock);
+		return NOTIFY_OK;
+	}
+	if (!data)
+		return NOTIFY_DONE;
+	blank = *(enum drm_notifier_data *)data;
 
-	return 0;
+	if (event == MI_DRM_EARLY_EVENT_BLANK &&
+	    blank == MI_DRM_BLANK_POWERDOWN) {
+		flush_workqueue(ts_data->event_wq);
+		queue_work(ts_data->event_wq, &ts_data->suspend_work);
+	} else if (event == MI_DRM_EVENT_BLANK &&
+		   blank == MI_DRM_BLANK_UNBLANK) {
+		flush_workqueue(ts_data->event_wq);
+		queue_work(ts_data->event_wq, &ts_data->resume_work);
+	}
+	return NOTIFY_OK;
 }
 #endif
 
 static int nvt_pm_suspend(struct device *dev)
 {
-	if (device_may_wakeup(dev) && ts->db_wakeup) {
-		NVT_LOG("enable touch irq wake\n");
-		enable_irq_wake(ts->client->irq);
-	}
-	ts->dev_pm_suspend = true;
-	reinit_completion(&ts->dev_pm_suspend_completion);
+	int ret = 0;
 
-	return 0;
+	mutex_lock(&ts->state_lock);
+	/* Display blank may already have armed it: never increment twice. */
+	if (device_may_wakeup(dev) && ts->gesture_active &&
+	    !ts->irq_wake_enabled) {
+		ret = enable_irq_wake(ts->client->irq);
+		if (ret)
+			goto out;
+		ts->irq_wake_enabled = true;
+	}
+	WRITE_ONCE(ts->dev_pm_suspend, true);
+	reinit_completion(&ts->dev_pm_suspend_completion);
+out:
+	mutex_unlock(&ts->state_lock);
+	return ret;
 }
 
 static int nvt_pm_resume(struct device *dev)
 {
-	if (device_may_wakeup(dev) && ts->db_wakeup) {
-		NVT_LOG("disable touch irq wake\n");
-		disable_irq_wake(ts->client->irq);
-	}
-	ts->dev_pm_suspend = false;
-	complete(&ts->dev_pm_suspend_completion);
-
+	mutex_lock(&ts->state_lock);
+	/* Keep wake armed if the display stays off after an unrelated resume. */
+	WRITE_ONCE(ts->dev_pm_suspend, false);
+	complete_all(&ts->dev_pm_suspend_completion);
+	mutex_unlock(&ts->state_lock);
 	return 0;
 }
 
