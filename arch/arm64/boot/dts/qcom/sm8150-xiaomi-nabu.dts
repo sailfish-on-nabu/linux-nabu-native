@@ -688,6 +688,7 @@
 		reset-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "BR";
+		cirrus,subsystem-id = "xiaomi-nabu";
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
@@ -704,6 +705,7 @@
 		reset-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "TR";
+		cirrus,subsystem-id = "xiaomi-nabu";
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
@@ -720,6 +722,7 @@
 		reset-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "BL";
+		cirrus,subsystem-id = "xiaomi-nabu";
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
@@ -736,6 +739,7 @@
 		reset-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "TL";
+		cirrus,subsystem-id = "xiaomi-nabu";
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
