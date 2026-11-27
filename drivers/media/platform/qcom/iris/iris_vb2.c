@@ -75,10 +75,14 @@ static int iris_check_session_supported(struct iris_inst *inst)
 	bool found = false;
 	int ret;
 
+	mutex_lock(&core->lock);
 	list_for_each_entry(instance, &core->instances, list) {
-		if (instance == inst)
+		if (instance == inst) {
 			found = true;
+			break;
+		}
 	}
+	mutex_unlock(&core->lock);
 
 	if (!found) {
 		ret = -EINVAL;
@@ -159,8 +163,7 @@ int iris_vb2_queue_setup(struct vb2_queue *q,
 
 		ret = inst->hfi_session_ops->session_open(inst);
 		if (ret) {
-			ret = -EINVAL;
-			dev_err(core->dev, "session open failed\n");
+			dev_err(core->dev, "session open failed: %d\n", ret);
 			goto unlock;
 		}
 

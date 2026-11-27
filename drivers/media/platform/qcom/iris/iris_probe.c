@@ -154,6 +154,9 @@ static void iris_unreserve_iova_region(struct device *dev, struct dma_iova_state
 {
 	unsigned int i;
 
+	if (!iova_state)
+		return;
+
 	for (i = 0; dma_iova_size(&iova_state[i]); i++)
 		dma_iova_free(dev, &iova_state[i]);
 }
@@ -251,6 +254,8 @@ static void iris_remove(struct platform_device *pdev)
 	if (!core)
 		return;
 
+	cancel_delayed_work_sync(&core->sys_error_handler);
+
 	iris_core_deinit(core);
 
 	video_unregister_device(core->vdev_dec);
@@ -304,6 +309,8 @@ static int iris_probe(struct platform_device *pdev)
 		return core->irq;
 
 	core->iris_platform_data = of_device_get_match_data(core->dev);
+	core->iris_firmware_desc = core->iris_platform_data->firmware_desc;
+	core->iris_firmware_data = core->iris_firmware_desc->firmware_data;
 
 	core->ubwc_cfg = qcom_ubwc_config_get_data();
 	if (IS_ERR(core->ubwc_cfg))
@@ -322,10 +329,14 @@ static int iris_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = iris_reserve_iova_region(dev, &core->iova_state, IRIS_NP_RESERVE_IOVA_START,
-				       IRIS_NP_RESERVE_IOVA_SIZE);
-	if (ret)
-		return ret;
+	if (!core->iris_platform_data->legacy_vpu5) {
+		ret = iris_reserve_iova_region(dev, &core->iova_state, IRIS_NP_RESERVE_IOVA_START,
+					       IRIS_NP_RESERVE_IOVA_SIZE);
+		if (ret)
+			return ret;
+	}
+
+	iris_session_init_caps(core);
 
 	ret = v4l2_device_register(dev, &core->v4l2_dev);
 	if (ret)
